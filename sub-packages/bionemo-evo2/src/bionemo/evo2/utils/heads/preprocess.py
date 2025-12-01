@@ -30,7 +30,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Semaphore
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -50,6 +50,9 @@ except ImportError:
     # Install pyBigWig if not available
     os.system("pip install pyBigWig")
     import pyBigWig
+
+# Enable for debugging purposes
+LOGGING: bool = False
 
 
 class Evo2Preprocessor:
@@ -327,42 +330,6 @@ class Evo2Preprocessor:
                 ),
             }
 
-    def _parse_genomic_coordinates(self, seqid: str, seq_length: int) -> Tuple[str, int, int]:
-        """Parse genomic coordinates from sequence ID.
-
-        Args:
-            seqid (str): Sequence ID.
-            seq_length (int): Length of the sequence.
-
-        Returns:
-            Tuple[str, int, int]: Chromosome name, start position, end position.
-        """
-        # Example parsing logic - adapt based on your SeqID format
-        # Format: "chr1:1000-2000" or "chr1_1000_2000"
-        try:
-            if ":" in seqid and "-" in seqid:
-                parts = seqid.split(":")
-                chromosome = parts[0]
-                coords = parts[1].split("-")
-                start_pos = int(coords[0])
-                end_pos = int(coords[1])
-            elif "_" in seqid:
-                parts = seqid.split("_")
-                chromosome = parts[0]
-                start_pos = int(parts[1]) if len(parts) > 1 else 0
-                end_pos = start_pos + seq_length
-            else:
-                # Default case - assume chromosome name only
-                chromosome = seqid
-                start_pos = 0
-                end_pos = seq_length
-
-            return chromosome, start_pos, end_pos
-
-        except (ValueError, IndexError) as e:
-            logging.warning(f"Could not parse coordinates from {seqid}: {e}")
-            return seqid, 0, seq_length
-
     # ---------------------------
     # END: BigWig File Hanldes
     # ---------------------------
@@ -397,12 +364,13 @@ class Evo2Preprocessor:
         bigwig_path = None
         if config.fasta_rnaseq_bigwig_map:  # type: ignore
             bigwig_path = config.fasta_rnaseq_bigwig_map.get(os.path.basename(filepath))  # type: ignore
+            if bigwig_path is None:
+                logging.warning(f"No BigWig mapping found for FASTA file: {os.path.basename(filepath)}")
         else:
             logging.warning("No BigWig mapping provided.")
 
         # Parse sequence ID to get genomic coordinates
-        chromosome, start_pos, end_pos = seqid, 0, len(seq)  # self._parse_genomic_coordinates(seqid, len(seq))
-
+        chromosome, start_pos, end_pos = seqid, 0, len(seq)
         # Extract RNA-seq values if BigWig is available
         rna_seq_values_dict = None
         if bigwig_path and chromosome:
@@ -475,7 +443,7 @@ class Evo2Preprocessor:
                     # Verify lengths match
                     if len(tokens_list[0]) != rna_seq.shape[0]:
                         raise ValueError(
-                            f"Token/RNA-seq length mismatch: tokens={len(tokens_list[0])}, rna_seq={rna_seq.shape[0]}"
+                            f"Token/RNA-seq for file {filepath} length mismatch: tokens={len(tokens_list[0])}, rna_seq={rna_seq.shape[0]}"
                         )
 
                     # Convert to list of list for consistency with token storage format, if problamatic, convert to np
@@ -641,6 +609,9 @@ class Evo2Preprocessor:
         avg_index_time = 0.0
         count = 0
 
+        train_id = 0
+        val_id = 0
+        test_id = 0
         for sequence, elapsed_time in self.preprocess_generator(preproc_config):
             index_start_time = time.time()
 
@@ -651,6 +622,12 @@ class Evo2Preprocessor:
             rna_seq_tensor = None
             if "rna_seq_targets" in sequence and sequence["rna_seq_targets"] is not None:  # ✅ CORRECT KEY
                 rna_seq_tensor = torch.Tensor(sequence["rna_seq_targets"])
+                # Before squeezing, ensure that shape is identical to tokens tensor
+                if rna_seq_tensor.shape != tokens_tensor.shape:
+                    raise ValueError(
+                        f"RNA-seq/tokens length mismatch: rna_seq={rna_seq_tensor.shape[1]}, tokens={tokens_tensor.shape[0]}"
+                    )
+
                 if rna_seq_tensor.dim() == 2 and rna_seq_tensor.shape[0] == 1:
                     rna_seq_tensor = rna_seq_tensor.squeeze(0)
 
@@ -659,23 +636,65 @@ class Evo2Preprocessor:
             if split == "train":
                 train_builder.add_item(tokens_tensor)
                 train_builder.end_document()
-                if isinstance(rna_seq_train_builder, IndexedDatasetBuilder) and rna_seq_tensor is not None:
-                    rna_seq_train_builder.add_item(rna_seq_tensor)
+                if isinstance(rna_seq_train_builder, IndexedDatasetBuilder):
+                    if rna_seq_tensor is not None:
+                        rna_seq_train_builder.add_item(rna_seq_tensor)
+                    else:
+                        # Add empty RNA-seq tensor if not available
+                        rna_seq_train_builder.add_item(
+                            torch.full(
+                                (tokens_tensor.shape[0],),
+                                preproc_config.rna_seq_missing_value,  # type: ignore
+                                dtype=torch.float32,
+                            )
+                        )
+                        logging.warning(
+                            f"RNA-seq tensor missing for train split; added placeholder tensor {train_id}."
+                        ) if LOGGING else None
                     rna_seq_train_builder.end_document()
+                    train_id += 1
 
             elif split == "val":
                 val_builder.add_item(tokens_tensor)
                 val_builder.end_document()
-                if isinstance(rna_seq_val_builder, IndexedDatasetBuilder) and rna_seq_tensor is not None:
-                    rna_seq_val_builder.add_item(rna_seq_tensor)
+                if isinstance(rna_seq_val_builder, IndexedDatasetBuilder):
+                    if rna_seq_tensor is not None:
+                        rna_seq_val_builder.add_item(rna_seq_tensor)
+                    else:
+                        # Add empty RNA-seq tensor if not available
+                        rna_seq_val_builder.add_item(
+                            torch.full(
+                                (tokens_tensor.shape[0],),
+                                preproc_config.rna_seq_missing_value,  # type: ignore
+                                dtype=torch.float32,
+                            )
+                        )
+                        logging.warning(
+                            f"RNA-seq tensor missing for val split; added placeholder tensor {val_id}."
+                        ) if LOGGING else None
                     rna_seq_val_builder.end_document()
+                    val_id += 1
 
             elif split == "test":
                 test_builder.add_item(tokens_tensor)
                 test_builder.end_document()
-                if isinstance(rna_seq_test_builder, IndexedDatasetBuilder) and rna_seq_tensor is not None:
-                    rna_seq_test_builder.add_item(rna_seq_tensor)
+                if isinstance(rna_seq_test_builder, IndexedDatasetBuilder):
+                    if rna_seq_tensor is not None:
+                        rna_seq_test_builder.add_item(rna_seq_tensor)
+                    else:
+                        # Add empty RNA-seq tensor if not available
+                        rna_seq_test_builder.add_item(
+                            torch.full(
+                                (tokens_tensor.shape[0],),
+                                preproc_config.rna_seq_missing_value,  # type: ignore
+                                dtype=torch.float32,
+                            )
+                        )
+                        logging.warning(
+                            f"RNA-seq tensor missing for test split; added placeholder tensor {test_id}."
+                        ) if LOGGING else None
                     rna_seq_test_builder.end_document()
+                    test_id += 1
 
             index_end_time = time.time()
             avg_preproc_time = (avg_preproc_time * count + elapsed_time) / (count + 1)
